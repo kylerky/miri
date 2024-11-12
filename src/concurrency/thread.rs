@@ -8,10 +8,14 @@ use std::time::{Duration, SystemTime};
 
 use either::Either;
 use rustc_const_eval::CTRL_C_RECEIVED;
+use rustc_const_eval::interpret::InterpError::UndefinedBehavior;
+use rustc_const_eval::interpret::UndefinedBehaviorInfo::DanglingIntPointer;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
+use rustc_middle::mir;
 use rustc_middle::mir::Mutability;
+use rustc_middle::ty::Instance;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
@@ -1187,6 +1191,44 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
     }
 
+    fn handle_ub(
+        this: &mut MiriInterpCx<'tcx>,
+        err: InterpErrorInfo<'tcx>,
+    ) -> InterpResult<'tcx, bool> {
+        match err.kind() {
+            UndefinedBehavior(DanglingIntPointer { addr, inbounds_size, msg: _ }) =>
+                if let Some(handler) = this.machine.dangling_ptr_handler {
+                    Self::call_dangling_ptr_handler(this, handler, *addr, *inbounds_size)?;
+                    interp_ok(true)
+                } else {
+                    Err(err).into()
+                },
+            _ => Err(err).into(),
+        }
+    }
+
+    fn call_dangling_ptr_handler(
+        this: &mut MiriInterpCx<'tcx>,
+        handler: Instance<'tcx>,
+        addr: u64,
+        inbounds_size: i64,
+    ) -> InterpResult<'tcx, ()> {
+        this.call_function(
+            handler,
+            Abi::Rust,
+            &[
+                ImmTy::from_scalar(Scalar::from_u64(addr), this.machine.layouts.u64),
+                ImmTy::from_scalar(Scalar::from_i64(inbounds_size), this.machine.layouts.i64),
+            ],
+            None,
+            StackPopCleanup::Goto {
+                ret: None,
+                unwind: mir::UnwindAction::Terminate(mir::UnwindTerminateReason::Abi),
+            },
+        )?;
+        interp_ok(())
+    }
+
     /// Run the core interpreter loop. Returns only when an interrupt occurs (an error or program
     /// termination).
     fn run_threads(&mut self) -> InterpResult<'tcx, !> {
@@ -1198,7 +1240,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             match this.machine.threads.schedule(&this.machine.clock)? {
                 SchedulingAction::ExecuteStep => {
-                    if !this.step()? {
+                    let can_continue = match this.step().report_err() {
+                        Ok(res) => res,
+                        Err(err) => Self::handle_ub(this, err)?,
+                    };
+                    if !can_continue {
                         // See if this thread can do something else.
                         match this.run_on_stack_empty()? {
                             Poll::Pending => {} // keep going
