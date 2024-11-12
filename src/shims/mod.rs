@@ -17,6 +17,7 @@ pub mod os_str;
 pub mod panic;
 pub mod time;
 pub mod tls;
+pub mod handler;
 
 pub use self::unix::{DirTable, EpollInterestTable, FdTable};
 

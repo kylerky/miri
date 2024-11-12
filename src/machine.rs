@@ -576,6 +576,8 @@ pub struct MiriMachine<'tcx> {
 
     /// A cache of "data range" computations for unions (i.e., the offsets of non-padding bytes).
     union_data_ranges: FxHashMap<Ty<'tcx>, RangeSet>,
+
+    pub(crate) dangling_ptr_handler: Option<Instance<'tcx>>,
 }
 
 impl<'tcx> MiriMachine<'tcx> {
@@ -713,6 +715,7 @@ impl<'tcx> MiriMachine<'tcx> {
             const_cache: RefCell::new(FxHashMap::default()),
             symbolic_alignment: RefCell::new(FxHashMap::default()),
             union_data_ranges: FxHashMap::default(),
+            dangling_ptr_handler: None,
         }
     }
 
@@ -825,6 +828,7 @@ impl VisitProvenance for MiriMachine<'_> {
             const_cache: _,
             symbolic_alignment: _,
             union_data_ranges: _,
+            dangling_ptr_handler: _,
         } = self;
 
         threads.visit_provenance(visit);

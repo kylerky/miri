@@ -16,6 +16,7 @@ use rustc_target::spec::abi::Abi;
 use self::helpers::{ToHost, ToSoft};
 use super::alloc::EvalContextExt as _;
 use super::backtrace::EvalContextExt as _;
+use super::handler::EvalContextExt as _;
 use crate::*;
 
 /// Type of dynamic symbols (for `dlsym` et al)
@@ -423,6 +424,11 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         this.machine.symbolic_alignment.get_mut().insert(alloc_id, (offset, align));
                     }
                 }
+            }
+
+            "miri_dangling_ptr_handler" => {
+                let [handler] = this.check_shim(abi, Abi::Rust, link_name, args)?;
+                this.register_handler(handler)?;
             }
 
             // Aborting the process.
