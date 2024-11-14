@@ -21,6 +21,7 @@ use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
 
 use crate::concurrency::data_race;
+use crate::machine::PtrTranslation;
 use crate::shims::tls;
 use crate::*;
 
@@ -1195,14 +1196,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this: &mut MiriInterpCx<'tcx>,
         err: InterpErrorInfo<'tcx>,
     ) -> InterpResult<'tcx, bool> {
-        match err.kind() {
-            UndefinedBehavior(DanglingIntPointer { addr, inbounds_size, msg: _ }) =>
-                if let Some(handler) = this.machine.dangling_ptr_handler {
-                    Self::call_dangling_ptr_handler(this, handler, *addr, *inbounds_size)?;
-                    interp_ok(true)
-                } else {
-                    Err(err).into()
-                },
+        let ptr_alloc_translation = *this.machine.ptr_alloc_translation.borrow();
+        let handler = this.machine.dangling_ptr_handler;
+        match (ptr_alloc_translation, handler, err.kind()) {
+            (
+                PtrTranslation::None,
+                Some(handler),
+                UndefinedBehavior(DanglingIntPointer { addr, inbounds_size, msg: _ }),
+            ) =>
+                Self::call_dangling_ptr_handler(this, handler, *addr, *inbounds_size).map(|_| true),
+
             _ => Err(err).into(),
         }
     }
@@ -1213,6 +1216,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         addr: u64,
         inbounds_size: i64,
     ) -> InterpResult<'tcx, ()> {
+        let ret_place = this.allocate(this.machine.layouts.u64, MiriMemoryKind::Machine.into())?;
         this.call_function(
             handler,
             Abi::Rust,
@@ -1220,12 +1224,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 ImmTy::from_scalar(Scalar::from_u64(addr), this.machine.layouts.u64),
                 ImmTy::from_scalar(Scalar::from_i64(inbounds_size), this.machine.layouts.i64),
             ],
-            None,
+            Some(&ret_place),
             StackPopCleanup::Goto {
                 ret: None,
                 unwind: mir::UnwindAction::Terminate(mir::UnwindTerminateReason::Abi),
             },
         )?;
+        *this.machine.ptr_alloc_translation.borrow_mut() = PtrTranslation::Pending(addr);
+        this.frame_mut().extra.is_handler_top = true;
         interp_ok(())
     }
 
@@ -1241,7 +1247,19 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             match this.machine.threads.schedule(&this.machine.clock)? {
                 SchedulingAction::ExecuteStep => {
                     let can_continue = match this.step().report_err() {
-                        Ok(res) => res,
+                        Ok(res) => {
+                            let ptr_translation = *this.machine.ptr_alloc_translation.borrow();
+                            match ptr_translation {
+                                PtrTranslation::Result(l, r) =>
+                                    *this.machine.ptr_alloc_translation.borrow_mut() =
+                                        PtrTranslation::InEffect(l, r),
+                                PtrTranslation::InEffect(..) =>
+                                    *this.machine.ptr_alloc_translation.borrow_mut() =
+                                        PtrTranslation::None,
+                                _ => (),
+                            }
+                            res
+                        }
                         Err(err) => Self::handle_ub(this, err)?,
                     };
                     if !can_continue {

@@ -72,6 +72,8 @@ pub struct FrameExtra<'tcx> {
 
     /// Data race detector per-frame data.
     pub data_race: Option<data_race::FrameState>,
+
+    pub is_handler_top: bool,
 }
 
 impl<'tcx> std::fmt::Debug for FrameExtra<'tcx> {
@@ -84,6 +86,7 @@ impl<'tcx> std::fmt::Debug for FrameExtra<'tcx> {
             is_user_relevant,
             salt,
             data_race,
+            is_handler_top,
         } = self;
         f.debug_struct("FrameData")
             .field("borrow_tracker", borrow_tracker)
@@ -91,6 +94,7 @@ impl<'tcx> std::fmt::Debug for FrameExtra<'tcx> {
             .field("is_user_relevant", is_user_relevant)
             .field("salt", salt)
             .field("data_race", data_race)
+            .field("is_handler_top", is_handler_top)
             .finish()
     }
 }
@@ -104,6 +108,7 @@ impl VisitProvenance for FrameExtra<'_> {
             is_user_relevant: _,
             salt: _,
             data_race: _,
+            is_handler_top: _,
         } = self;
 
         catch_unwind.visit_provenance(visit);
@@ -416,6 +421,14 @@ impl<'tcx> PrimitiveLayouts<'tcx> {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum PtrTranslation {
+    None,
+    Pending(u64),
+    Result(u64, u64),
+    InEffect(u64, u64),
+}
+
 /// The machine itself.
 ///
 /// If you add anything here that stores machine values, remember to update
@@ -578,6 +591,7 @@ pub struct MiriMachine<'tcx> {
     union_data_ranges: FxHashMap<Ty<'tcx>, RangeSet>,
 
     pub(crate) dangling_ptr_handler: Option<Instance<'tcx>>,
+    pub(crate) ptr_alloc_translation: RefCell<PtrTranslation>,
 }
 
 impl<'tcx> MiriMachine<'tcx> {
@@ -716,6 +730,7 @@ impl<'tcx> MiriMachine<'tcx> {
             symbolic_alignment: RefCell::new(FxHashMap::default()),
             union_data_ranges: FxHashMap::default(),
             dangling_ptr_handler: None,
+            ptr_alloc_translation: RefCell::new(PtrTranslation::None),
         }
     }
 
@@ -829,6 +844,7 @@ impl VisitProvenance for MiriMachine<'_> {
             symbolic_alignment: _,
             union_data_ranges: _,
             dangling_ptr_handler: _,
+            ptr_alloc_translation: _,
         } = self;
 
         threads.visit_provenance(visit);
@@ -1251,6 +1267,15 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         ptr: StrictPointer,
         size: i64,
     ) -> Option<(AllocId, Size, Self::ProvenanceExtra)> {
+        let ptr_translation = *ecx.machine.ptr_alloc_translation.borrow();
+        let ptr = match (ptr_translation, ptr.into_parts()) {
+            (
+                PtrTranslation::InEffect(original_addr, translated_addr),
+                (Provenance::Wildcard, offset),
+            ) if original_addr == offset.bytes() =>
+                StrictPointer::new(Provenance::Wildcard, Size::from_bytes(translated_addr)),
+            _ => ptr,
+        };
         let rel = ecx.ptr_get_alloc(ptr, size);
 
         rel.map(|(alloc_id, size)| {
@@ -1442,6 +1467,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             is_user_relevant: ecx.machine.is_user_relevant(&frame),
             salt: ecx.machine.rng.borrow_mut().gen::<usize>() % ADDRS_PER_ANON_GLOBAL,
             data_race: ecx.machine.data_race.as_ref().map(|_| data_race::FrameState::default()),
+            is_handler_top: false,
         };
 
         interp_ok(frame.with_extra(extra))
@@ -1532,8 +1558,38 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         let res = {
             // Move `frame`` into a sub-scope so we control when it will be dropped.
             let mut frame = frame;
+
             let timing = frame.extra.timing.take();
+            let is_handler_top = frame.extra.is_handler_top;
+            let ret_place = frame.return_place;
+
             let res = ecx.handle_stack_pop_unwind(frame.extra, unwinding);
+
+            let this = ecx.eval_context_mut();
+            let ptr_translation = *this.machine.ptr_alloc_translation.borrow();
+            let res = match (is_handler_top, unwinding, ptr_translation) {
+                (false, _, _) | (_, true, _) => res,
+                (true, false, PtrTranslation::Pending(original_addr)) =>
+                    res.and_then(|_| this.read_scalar(&ret_place))
+                        .and_then(|scalar| scalar.to_u64())
+                        .map(|translated_addr| {
+                            info!(
+                                "address translation 0x{:x} => 0x{:x}",
+                                original_addr, translated_addr
+                            );
+                            *this.machine.ptr_alloc_translation.borrow_mut() =
+                                PtrTranslation::Result(original_addr, translated_addr);
+                            ReturnAction::NoJump
+                        }),
+                _ => {
+                    res?;
+                    throw_ub_format!(
+                        "Unexpected states after dealing with the dangling pointer, {:?}",
+                        ptr_translation
+                    );
+                }
+            };
+
             if let Some(profiler) = ecx.machine.profiler.as_ref() {
                 profiler.finish_recording_interval_event(timing.unwrap());
             }
