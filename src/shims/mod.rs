@@ -18,6 +18,7 @@ pub mod os_str;
 pub mod panic;
 pub mod time;
 pub mod tls;
+pub mod mem_mapping;
 
 pub use self::files::FdTable;
 pub use self::unix::{DirTable, EpollInterestTable};

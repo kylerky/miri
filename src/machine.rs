@@ -447,6 +447,7 @@ pub struct MiriMachine<'tcx> {
 
     /// Ptr-int-cast module global data.
     pub alloc_addresses: alloc_addresses::GlobalState,
+    pub address_mapping: RefCell<Vec<(u64, u64, u64)>>,
 
     /// Environment variables.
     pub(crate) env_vars: EnvVars<'tcx>,
@@ -657,6 +658,7 @@ impl<'tcx> MiriMachine<'tcx> {
             borrow_tracker,
             data_race,
             alloc_addresses: RefCell::new(alloc_addresses::GlobalStateInner::new(config, stack_addr)),
+            address_mapping: RefCell::new(Vec::new()),
             // `env_vars` depends on a full interpreter so we cannot properly initialize it yet.
             env_vars: EnvVars::default(),
             main_fn_ret_place: None,
@@ -805,6 +807,7 @@ impl VisitProvenance for MiriMachine<'_> {
             borrow_tracker,
             data_race,
             alloc_addresses,
+            address_mapping: _,
             fds,
             epoll_interests:_,
             tcx: _,
@@ -1269,14 +1272,40 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         ptr: StrictPointer,
         size: i64,
     ) -> Option<(AllocId, Size, Self::ProvenanceExtra)> {
+        let (prov, offset) = ptr.into_parts();
         let rel = ecx.ptr_get_alloc(ptr, size);
+        let rel = match prov {
+            Provenance::Wildcard if rel.is_none() => {
+                let addr = offset.bytes();
+                let addr = if size >= 0 { addr } else { addr.saturating_sub(1) };
+                let mapping = ecx.machine.address_mapping.borrow();
+                let translated_addr =
+                    match mapping.binary_search_by_key(&addr, |(original, _, _)| *original) {
+                        Ok(pos) => {
+                            let (base_addr, mapped_addr, _) = mapping[pos];
+                            let offset = addr - base_addr;
+                            Some(mapped_addr + offset)
+                        }
+                        Err(0) => None,
+                        Err(pos) => {
+                            let (base_addr, mapped_addr, mapped_size) = mapping[pos - 1];
+                            let offset = addr - base_addr;
+                            if offset < mapped_size { Some(mapped_addr + offset) } else { None }
+                        }
+                    };
+                translated_addr.and_then(|result| {
+                    let ptr = StrictPointer::new(prov, Size::from_bytes(result));
+                    ecx.ptr_get_alloc(ptr, size)
+                })
+            }
+            _ => rel,
+        };
 
         rel.map(|(alloc_id, size)| {
-            let tag = match ptr.provenance {
+            (alloc_id, size, match prov {
                 Provenance::Concrete { tag, .. } => ProvenanceExtra::Concrete(tag),
                 Provenance::Wildcard => ProvenanceExtra::Wildcard,
-            };
-            (alloc_id, size, tag)
+            })
         })
     }
 

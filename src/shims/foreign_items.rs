@@ -15,6 +15,7 @@ use rustc_span::Symbol;
 use self::helpers::{ToHost, ToSoft};
 use super::alloc::EvalContextExt as _;
 use super::backtrace::EvalContextExt as _;
+use super::mem_mapping::EvalContextExt as _;
 use crate::*;
 
 /// Type of dynamic symbols (for `dlsym` et al)
@@ -423,6 +424,15 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         this.machine.symbolic_alignment.get_mut().insert(alloc_id, (offset, align));
                     }
                 }
+            }
+
+            "miri_add_mapping" => {
+                let [original_addr, target_addr, size] =
+                    this.check_shim(abi, ExternAbi::Rust, link_name, args)?;
+                let original_addr = this.read_scalar(original_addr)?.to_u64()?;
+                let target_addr = this.read_scalar(target_addr)?.to_u64()?;
+                let size = this.read_scalar(size)?.to_u64()?;
+                this.miri_add_mapping(original_addr, target_addr, size);
             }
 
             // Aborting the process.
